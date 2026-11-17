@@ -1,134 +1,103 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+import { STEP, BEST_KEY } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createInput } from './input.js';
+import { createCity } from './city.js';
+import { populateCars, updateVehicles } from './vehicles.js';
+import { populatePeople, updatePeople } from './people.js';
+import { createPlayer, updatePlayer } from './player.js';
+import { createMission, updateMissions } from './missions.js';
+import { updateCombat } from './combat.js';
+import { createAudio } from './audio.js';
+import { createRenderer } from './render.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
+const params = new URLSearchParams(location.search);
+const seed = Number(params.get('seed') ?? Math.floor(Math.random() * 4294967296));
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+const audio = createAudio();
+const input = createInput(canvas);
+let best = { cash: 0, missions: 0 };
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+try {
+  const data = JSON.parse(localStorage.getItem(BEST_KEY));
+  if (data) best = { cash: Number(data.cash) || 0, missions: Number(data.missions) || 0 };
+} catch {}
+
+let w;
+
+function reset() {
+  const rng = createRandom(seed);
+  w = {
+    rng, city: createCity(rng), player: createPlayer(), mission: createMission(), cars: [], people: [], bullets: [], skids: [],
+    pickups: [{ x: 1120, y: 1050, type: 'ammo' }, { x: 390, y: 2150, type: 'health' }, { x: 1820, y: 2125, type: 'ammo' }, { x: 2490, y: 760, type: 'health' }],
+    time: 0, noise: 0, flash: 0, punch: 0, nextCop: 0, bust: 0, audio, screen: 'title', best, muted: false, notice: '',
+    save() {
+      best.cash = Math.max(best.cash, w.player.cash); best.missions = Math.max(best.missions, w.mission.index);
+      try { localStorage.setItem(BEST_KEY, JSON.stringify(best)); } catch {}
+    }
+  };
+  populateCars(w); populatePeople(w);
+}
+
+function setScreen(screen) { w.screen = screen; }
+
+function stepWorld() {
+  w.time += STEP;
+  updateMissions(w, input, STEP);
+  if (w.screen !== 'play') return false;
+  updatePlayer(w, input, STEP); updateVehicles(w, STEP); updatePeople(w, STEP); updateCombat(w, input, STEP);
+  for (const skid of w.skids) skid.life -= STEP;
+  w.skids = w.skids.filter(skid => skid.life > 0).slice(-200);
+  audio.update(w);
+  if (w.player.health <= 0 || w.bust >= 3) { setScreen('over'); w.save(); }
+  return true;
+}
+
+function handleInput() {
+  if (input.tap('KeyM')) { audio.unlock(); w.muted = audio.toggle(); }
+  if (input.tap('Enter')) {
+    audio.unlock();
+    if (w.screen === 'title' || w.screen === 'over') { reset(); setScreen('play'); }
+    else if (w.screen === 'paused' || w.screen === 'complete') setScreen('play');
+  }
+  if (input.pause()) {
+    if (w.screen === 'play') setScreen('paused');
+    else if (w.screen === 'paused') setScreen('play');
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function updateStatus(announced) {
+  const message = w.screen + ' · ' + (w.mission.legend ? 'Solmar Legend' : w.mission.active ? 'Mission ' + (w.mission.index + 1) : 'Meet Marisol') + ' · Wanted ' + w.player.wanted;
+  if (message !== announced) { status.textContent = message; return message; }
+  return announced;
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+function boot() {
+  reset();
+  const shot = params.get('shot');
+  if (shot) {
+    stageShot(shot, w);
+    requestAnimationFrame(() => { renderer.draw(w); requestAnimationFrame(() => { renderer.draw(w); window.__shotReady = true; }); });
+    return;
   }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
+  let last = performance.now(), accumulator = 0, announced = '';
   function frame(now) {
     requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    accumulator += Math.min(.25, (now - last) / 1000); last = now;
+    handleInput();
+    if (w.screen === 'play') {
+      while (accumulator >= STEP) {
+        if (!stepWorld()) { accumulator = 0; break; }
         accumulator -= STEP;
       }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
+    } else accumulator = 0;
+    announced = updateStatus(announced);
+    renderer.draw(w);
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+  document.addEventListener('visibilitychange', () => { if (document.hidden && w.screen === 'play') setScreen('paused'); });
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+boot();
